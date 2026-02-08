@@ -187,7 +187,7 @@ class AliasManager:
             return False
         # Basic check for path-like characters or other problematic chars.
         # Allows alphanumeric, underscore, hyphen.
-        if not re.fullmatch(r"^[a-zA-Z0-9_-]+$", name):
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
             return False
         return True
 
@@ -241,10 +241,10 @@ class AliasManager:
 
             if is_user and list_user:
                 command_str = self.user_aliases_map[name]
-                source_type = "(user)"
-            elif is_core and list_core and not is_user : # Show core only if not overridden by user or if user listing is off
+                source_type = "(user)" + (" (overrides core)" if is_core else "")
+            elif is_core and list_core:
                 command_str = self.core_aliases_map[name]
-                source_type = "(core)"
+                source_type = "(core)" + (" (overridden by user)" if is_user else "")
             
             if command_str: # If we have something to show based on filters
                  output_lines.append(f"- [cyan]{name}[/cyan] {source_type}: \"{command_str}\"")
@@ -569,8 +569,8 @@ def _download_and_read_file(url):
         response = requests.get(url, headers=headers if TOKEN != DEFAULT_GITHUB_TOKEN else None, timeout=30)
         response.raise_for_status()
         
-        # Try to determine encoding
-        encoding = response.encoding or 'utf-8'
+        # Use apparent_encoding (chardet-based) to avoid RFC 2616 ISO-8859-1 default
+        encoding = response.apparent_encoding or 'utf-8'
         
         try:
             # Try to decode as text
@@ -825,7 +825,9 @@ def process_arxiv_pdf(arxiv_abs_url):
     """
     Downloads and extracts text from an ArXiv PDF, wrapped in XML.
     """
-    pdf_url = arxiv_abs_url.replace("/abs/", "/pdf/") + ".pdf"
+    # Strip query parameters before constructing PDF URL
+    arxiv_clean_url = arxiv_abs_url.split('?')[0].split('#')[0]
+    pdf_url = arxiv_clean_url.replace("/abs/", "/pdf/") + ".pdf"
     if OFFLINE_MODE:
         msg = "Offline mode enabled; skipping ArXiv download"
         print(f"[bold yellow]{msg}[/bold yellow]")
@@ -1137,8 +1139,10 @@ def _load_tiktoken_encoding():
     return None
 
 
-def get_token_count(text, disallowed_special=[], chunk_size=1000):
+def get_token_count(text, disallowed_special=None, chunk_size=1000):
     """Counts tokens using tiktoken, with offline fallback."""
+    if disallowed_special is None:
+        disallowed_special = []
     enc = _load_tiktoken_encoding()
 
     # Remove XML tags before counting tokens
@@ -1211,7 +1215,9 @@ def crawl_and_extract_text(base_url, max_depth, include_pdfs, ignore_epubs):
         }
 
     visited_urls = set()
-    urls_to_visit = [(base_url, 0)]
+    from collections import deque
+    urls_to_visit = deque([(base_url, 0)])
+    queued_urls = {base_url}  # Track URLs already in the queue for O(1) lookups
     processed_urls_content = {} # Store URL -> content/error
     # Start XML structure
     all_text = [f'<source type="web_crawl" base_url="{escape_xml(base_url)}">']
@@ -1219,7 +1225,7 @@ def crawl_and_extract_text(base_url, max_depth, include_pdfs, ignore_epubs):
     print(f"Starting crawl from: {base_url} (Max Depth: {max_depth}, Include PDFs: {include_pdfs})")
 
     while urls_to_visit:
-        current_url, current_depth = urls_to_visit.pop(0)
+        current_url, current_depth = urls_to_visit.popleft()
         # Normalize URL: remove fragment and ensure scheme
         parsed_url = urlparse(current_url)
         clean_url = urlparse(current_url)._replace(fragment="").geturl()
@@ -1292,13 +1298,12 @@ def crawl_and_extract_text(base_url, max_depth, include_pdfs, ignore_epubs):
 
                                     new_clean_url = urlparse(new_url)._replace(fragment="").geturl()
 
-                                    if new_clean_url not in visited_urls:
+                                    if new_clean_url not in visited_urls and new_clean_url not in queued_urls:
                                         # Check domain/depth *before* adding to queue
                                         if is_same_domain(base_url, new_clean_url) and is_within_depth(base_url, new_clean_url, max_depth):
                                              if not (ignore_epubs and new_clean_url.lower().endswith('.epub')):
-                                                # Add only if valid and not already visited
-                                                if (new_clean_url, current_depth + 1) not in urls_to_visit:
-                                                     urls_to_visit.append((new_clean_url, current_depth + 1))
+                                                queued_urls.add(new_clean_url)
+                                                urls_to_visit.append((new_clean_url, current_depth + 1))
                             except Exception as link_err: # Catch errors parsing individual links
                                 print(f"  [bold yellow]Warning:[/bold yellow] Error parsing link '{link.get('href')}': {link_err}")
 
@@ -1378,6 +1383,7 @@ class DocCrawler:
         self.visited_urls: Set[str] = set()
         self.pages_crawled = 0
         self.failed_urls: List[Tuple[str, str]] = []
+        self._lock = asyncio.Lock()
         
         parsed_start = urlparse(self.start_url)
         self.domain = parsed_start.netloc
@@ -1394,8 +1400,20 @@ class DocCrawler:
         self.max_pages = getattr(self.config, 'crawl_max_pages', 1000)  # Increased default from 100 to 1000
         self.user_agent = getattr(self.config, 'crawl_user_agent', "OneFileLLMCrawler/1.1")
         self.delay = getattr(self.config, 'crawl_delay', 0.25)
-        self.include_pattern = re.compile(self.config.crawl_include_pattern) if getattr(self.config, 'crawl_include_pattern', None) else None
-        self.exclude_pattern = re.compile(self.config.crawl_exclude_pattern) if getattr(self.config, 'crawl_exclude_pattern', None) else None
+        self.include_pattern = None
+        if getattr(self.config, 'crawl_include_pattern', None):
+            try:
+                self.include_pattern = re.compile(self.config.crawl_include_pattern)
+            except re.error as e:
+                self.console.print(f"[bold red]Error:[/bold red] Invalid --crawl-include-pattern: {e}")
+                raise
+        self.exclude_pattern = None
+        if getattr(self.config, 'crawl_exclude_pattern', None):
+            try:
+                self.exclude_pattern = re.compile(self.config.crawl_exclude_pattern)
+            except re.error as e:
+                self.console.print(f"[bold red]Error:[/bold red] Invalid --crawl-exclude-pattern: {e}")
+                raise
         self.timeout = getattr(self.config, 'crawl_timeout', 20)
         self.include_images = getattr(self.config, 'crawl_include_images', False)
         self.include_code = getattr(self.config, 'crawl_include_code', True)
@@ -1419,7 +1437,8 @@ class DocCrawler:
             "Accept-Language": "en-US,en;q=0.5",
             "Connection": "keep-alive",
         }
-        self.session = aiohttp.ClientSession(headers=headers)
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
 
     async def _close_session(self):
         if self.session:
@@ -1484,29 +1503,33 @@ class DocCrawler:
         # Note: robots.txt check is async, so it's done in the worker.
         return True
 
+    MAX_RESPONSE_SIZE = 50 * 1024 * 1024  # 50 MB safety limit per page
+
     async def _fetch_url_content(self, url: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
         if not self.session:
             await self._init_session()
-        
+
         try:
-            async with self.session.get(url, timeout=self.timeout) as response:
+            async with self.session.get(url) as response:
                 content_type_header = response.headers.get('Content-Type', '')
                 if response.status != 200:
                     return None, f"HTTP Error {response.status}: {response.reason}", content_type_header
-                
-                # Read content as bytes first to handle different types
-                content_bytes = await response.read()
+
+                # Check Content-Length before reading to avoid OOM
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > self.MAX_RESPONSE_SIZE:
+                    return None, f"Response too large ({int(content_length)} bytes)", content_type_header
+
+                # Read content as bytes with size limit
+                content_bytes = await response.content.read(self.MAX_RESPONSE_SIZE + 1)
+                if len(content_bytes) > self.MAX_RESPONSE_SIZE:
+                    return None, f"Response exceeded {self.MAX_RESPONSE_SIZE} byte limit", content_type_header
                 return content_bytes, None, content_type_header
-                
+
         except asyncio.TimeoutError:
             return None, "Request timed out", None
         except Exception as e:
-            # Check if it's an aiohttp ClientError
-            if e.__class__.__name__ == 'ClientError':
-                return None, f"Client error: {e}", None
-            return None, f"Client error: {e}", None
-        except Exception as e:
-            return None, f"Unexpected fetch error: {e}", None
+            return None, f"Fetch error ({type(e).__name__}): {e}", None
 
     def _extract_page_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
         links = []
@@ -1725,64 +1748,70 @@ class DocCrawler:
             try:
                 url, depth = await queue.get()
 
-                if self.pages_crawled >= self.max_pages:
-                    queue.task_done()
-                    continue
-                
+                async with self._lock:
+                    if self.pages_crawled >= self.max_pages:
+                        queue.task_done()
+                        continue
+
+                    if url in self.visited_urls:
+                        queue.task_done()
+                        continue
+
+                    self.visited_urls.add(url)
+
                 # Perform async robots.txt check here
                 if not await self._can_fetch_robots(url):
                     self.console.print(f"  [dim]Skipping (robots.txt): {url}[/dim]")
-                    self.visited_urls.add(url)
                     queue.task_done()
                     continue
 
                 # _should_crawl_url is synchronous and checks other conditions
                 if not self._should_crawl_url(url):
-                    self.visited_urls.add(url)
                     queue.task_done()
                     continue
 
-                self.visited_urls.add(url)
                 await asyncio.sleep(self.delay)
 
                 # Only print crawling message if not using progress bar
                 if not self.rich_progress:
                     self.console.print(f"[cyan]Crawling (Depth {depth}):[/cyan] {url}")
-                
+
                 content_bytes, error_msg, content_type_header = await self._fetch_url_content(url)
 
                 page_data_dict = None
+                html_text_content = None
                 if error_msg:
                     self.console.print(f"  [yellow]Failed to fetch {url}: {error_msg}[/yellow]")
-                    self.failed_urls.append((url, error_msg))
+                    async with self._lock:
+                        self.failed_urls.append((url, error_msg))
                 elif content_bytes and content_type_header:
                     if 'application/pdf' in content_type_header.lower() and self.include_pdfs:
                         page_data_dict = await self._process_pdf_content_from_bytes(content_bytes, url)
                     elif 'text/html' in content_type_header.lower():
                         try:
-                            # Attempt to decode HTML content
                             html_text_content = content_bytes.decode('utf-8')
                         except UnicodeDecodeError:
                             try:
                                 html_text_content = content_bytes.decode('latin-1')
                             except UnicodeDecodeError as ude:
                                 self.console.print(f"  [yellow]Failed to decode HTML for {url}: {ude}[/yellow]")
-                                self.failed_urls.append((url, f"Unicode decode error: {ude}"))
-                                html_text_content = None
+                                async with self._lock:
+                                    self.failed_urls.append((url, f"Unicode decode error: {ude}"))
                         if html_text_content:
                             page_data_dict = self._process_html_to_structured_data(html_text_content, url)
                     else:
                         self.console.print(f"  [dim]Skipping non-HTML/PDF content ({content_type_header}): {url}[/dim]")
-                
+
                 if page_data_dict:
-                    self._add_page_to_xml_output(page_data_dict)
-                    self.pages_crawled += 1
-                    if self.rich_progress and self.progress_task_id is not None:
-                        self.rich_progress.update(self.progress_task_id, advance=1, description=f"Crawled {self.pages_crawled}/{self.max_pages} pages")
+                    async with self._lock:
+                        self._add_page_to_xml_output(page_data_dict)
+                        self.pages_crawled += 1
+                        if self.rich_progress and self.progress_task_id is not None:
+                            self.rich_progress.update(self.progress_task_id, advance=1, description=f"Crawled {self.pages_crawled}/{self.max_pages} pages")
 
                 # Add new links to queue if depth and page count allow
                 if page_data_dict and depth < self.max_depth and 'text/html' in (content_type_header or ""):
-                    if 'html_text_content' in locals() and html_text_content:
+                    if html_text_content:
                         soup_for_links = BeautifulSoup(html_text_content, 'lxml')
                         new_links = self._extract_page_links(soup_for_links, url)
                         for link_to_add in new_links:
@@ -2067,18 +2096,36 @@ def process_github_pull_request(pull_request_url):
         if comments_url:
             print("Fetching PR comments...")
             try:
-                comments_response = requests.get(comments_url, headers=headers, timeout=30)
-                comments_response.raise_for_status()
-                all_comments_data.extend(comments_response.json())
+                comment_page = 1
+                while True:
+                    params = {'per_page': 100, 'page': comment_page}
+                    comments_response = requests.get(comments_url, headers=headers, params=params, timeout=30)
+                    comments_response.raise_for_status()
+                    batch = comments_response.json()
+                    if not batch:
+                        break
+                    all_comments_data.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    comment_page += 1
             except requests.RequestException as e:
                 print(f"[bold yellow]Warning:[/bold yellow] Could not fetch PR comments: {e}")
 
         if review_comments_url:
              print("Fetching PR review comments...")
              try:
-                 review_comments_response = requests.get(review_comments_url, headers=headers, timeout=30)
-                 review_comments_response.raise_for_status()
-                 all_comments_data.extend(review_comments_response.json())
+                 review_page = 1
+                 while True:
+                     params = {'per_page': 100, 'page': review_page}
+                     review_comments_response = requests.get(review_comments_url, headers=headers, params=params, timeout=30)
+                     review_comments_response.raise_for_status()
+                     batch = review_comments_response.json()
+                     if not batch:
+                         break
+                     all_comments_data.extend(batch)
+                     if len(batch) < 100:
+                         break
+                     review_page += 1
              except requests.RequestException as e:
                  print(f"[bold yellow]Warning:[/bold yellow] Could not fetch review comments: {e}")
 
@@ -2167,15 +2214,24 @@ def process_github_issue(issue_url):
         formatted_text_list.append(f'<details>{escape_xml(details)}</details>')
 
 
-        # Fetch and add comments
+        # Fetch and add comments (with pagination)
         comments_data = []
         comments_url = issue_data.get("comments_url")
         if comments_url:
             print("Fetching issue comments...")
             try:
-                comments_response = requests.get(comments_url, headers=headers, timeout=30)
-                comments_response.raise_for_status()
-                comments_data = comments_response.json()
+                comment_page = 1
+                while True:
+                    params = {'per_page': 100, 'page': comment_page}
+                    comments_response = requests.get(comments_url, headers=headers, params=params, timeout=30)
+                    comments_response.raise_for_status()
+                    batch = comments_response.json()
+                    if not batch:
+                        break
+                    comments_data.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    comment_page += 1
             except requests.RequestException as e:
                 print(f"[bold yellow]Warning:[/bold yellow] Could not fetch issue comments: {e}")
 
@@ -2244,6 +2300,7 @@ def process_github_issues(issues_url):
 
     api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/issues"
 
+    MAX_ISSUES = 500  # Safety limit to prevent memory exhaustion on large repos
     issues = []
     page = 1
     try:
@@ -2255,6 +2312,10 @@ def process_github_issues(issues_url):
             if not batch:
                 break
             issues.extend(batch)
+            if len(issues) >= MAX_ISSUES:
+                print(f"[bold yellow]Warning:[/bold yellow] Reached maximum issue limit ({MAX_ISSUES}). Truncating.")
+                issues = issues[:MAX_ISSUES]
+                break
             if len(batch) < 100:
                 break
             page += 1
@@ -2278,14 +2339,23 @@ def process_github_issues(issues_url):
             )
             formatted.append(f'<details>{escape_xml(details)}</details>')
 
-            # Fetch comments
+            # Fetch comments (with pagination)
             comments_url = issue.get('comments_url')
             comments = []
             if comments_url:
                 try:
-                    comments_resp = requests.get(comments_url, headers=headers, timeout=30)
-                    comments_resp.raise_for_status()
-                    comments = comments_resp.json()
+                    comment_page = 1
+                    while True:
+                        params = {'per_page': 100, 'page': comment_page}
+                        comments_resp = requests.get(comments_url, headers=headers, params=params, timeout=30)
+                        comments_resp.raise_for_status()
+                        batch = comments_resp.json()
+                        if not batch:
+                            break
+                        comments.extend(batch)
+                        if len(batch) < 100:
+                            break
+                        comment_page += 1
                 except requests.RequestException as e:
                     print(f"[bold yellow]Warning:[/bold yellow] Could not fetch issue comments: {e}")
 
@@ -3525,9 +3595,13 @@ async def main(argv: Optional[List[str]] = None):
         stream_source_dict = {}
         stream_content_to_process = None
 
-    finally:
-        # Restore original sys.argv if it was modified
+    except (SystemExit, Exception):
+        # Restore sys.argv and re-raise if arg parsing or alias commands fail
         sys.argv = original_sys_argv
+        raise
+
+    # Restore original sys.argv now that parsing is complete
+    sys.argv = original_sys_argv
     user_format_override = args.format
 
     # Determine stdin usage

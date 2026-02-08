@@ -1,6 +1,8 @@
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, abort
 import os
 import sys
+import ipaddress
+from urllib.parse import urlparse
 
 # Import functions from onefilellm.py.
 # Ensure onefilellm.py is accessible in the same directory.
@@ -13,6 +15,12 @@ from rich.console import Console
 
 app = Flask(__name__)
 console = Console()
+
+# Directory where output files are written; downloads are restricted to this directory.
+OUTPUT_DIR = os.path.abspath(".")
+
+# Allowed filenames that may be downloaded via /download.
+ALLOWED_DOWNLOAD_FILES = {"uncompressed_output.txt", "compressed_output.txt"}
 
 # Simple HTML template using inline rendering for demonstration.
 template = """
@@ -31,8 +39,8 @@ template = """
 <body>
     <h1>1FileLLM Web Interface</h1>
     <form method="POST" action="/">
-        <p>Enter a URL, path, DOI, or PMID:</p>
-        <input type="text" name="input_path" required placeholder="e.g. https://github.com/jimmc414/1filellm or /path/to/local/folder"/>
+        <p>Enter a URL, DOI, or PMID:</p>
+        <input type="text" name="input_path" required placeholder="e.g. https://github.com/jimmc414/1filellm or 10.1234/example"/>
         <button type="submit">Process</button>
     </form>
 
@@ -40,7 +48,7 @@ template = """
     <div class="output-container">
         <h2>Processed Output</h2>
         <pre>{{ output }}</pre>
-        
+
         <h3>Token Counts</h3>
         <p>Uncompressed Tokens: {{ uncompressed_token_count }}<br>
         Compressed Tokens: {{ compressed_token_count }}</p>
@@ -55,6 +63,28 @@ template = """
 </html>
 """
 
+
+def _is_safe_url(url: str) -> bool:
+    """Reject URLs targeting private/internal networks (SSRF protection)."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Reject common metadata endpoints and localhost
+        if hostname in ("localhost", "metadata.google.internal"):
+            return False
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                return False
+        except ValueError:
+            pass  # hostname is a domain name, not an IP
+        return True
+    except Exception:
+        return False
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
@@ -67,10 +97,11 @@ def index():
 
         # Determine input type and process accordingly (mirroring logic from onefilellm.py main)
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(input_path)
 
             if "github.com" in input_path:
+                if not _is_safe_url(input_path):
+                    return render_template_string(template, output="Error: URL rejected by security policy.")
                 if "/pull/" in input_path:
                     final_output = process_github_pull_request(input_path)
                 elif "/issues/" in input_path:
@@ -78,6 +109,8 @@ def index():
                 else:
                     final_output = process_github_repo(input_path)
             elif parsed.scheme in ["http", "https"]:
+                if not _is_safe_url(input_path):
+                    return render_template_string(template, output="Error: URL rejected by security policy.")
                 if "youtube.com" in input_path or "youtu.be" in input_path:
                     final_output = fetch_youtube_transcript(input_path)
                 elif "arxiv.org" in input_path:
@@ -90,7 +123,8 @@ def index():
             elif (input_path.startswith("10.") and "/" in input_path) or input_path.isdigit():
                 final_output = process_doi_or_pmid(input_path)
             else:
-                final_output = process_local_folder(input_path, console)
+                # Reject local path processing from the web app (C2: SSRF/path traversal)
+                return render_template_string(template, output="Error: Local path processing is not allowed via the web interface.")
 
             # Write the uncompressed output
             with open(output_file, "w", encoding="utf-8") as file:
@@ -121,10 +155,20 @@ def index():
 @app.route("/download")
 def download():
     filename = request.args.get("filename")
-    if filename and os.path.exists(filename):
-        return send_file(filename, as_attachment=True)
-    return "File not found", 404
+    if not filename:
+        abort(404)
+
+    # C1 fix: Only allow downloading specific output files from the output directory
+    basename = os.path.basename(filename)
+    if basename not in ALLOWED_DOWNLOAD_FILES:
+        abort(403)
+
+    safe_path = os.path.join(OUTPUT_DIR, basename)
+    if not os.path.isfile(safe_path):
+        abort(404)
+
+    return send_file(safe_path, as_attachment=True)
 
 if __name__ == "__main__":
-    # Run the app in debug mode for local development
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # C3 fix: Never use debug=True in production; bind to localhost only
+    app.run(debug=False, host="127.0.0.1", port=5000)

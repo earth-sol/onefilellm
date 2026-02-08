@@ -263,11 +263,12 @@ class TestUtilityFunctions(unittest.TestCase):
                 # Ensure caller's headers dictionary is not mutated
                 self.assertEqual(custom_headers, {'Authorization': 'token abc123', 'X-Test': '1'})
 
-        # Error handling: ensure no exception and file not created
+        # Error handling: ensure exception is raised after printing error
         error_path = os.path.join(self.temp_dir, "error.bin")
         with patch("utils.requests.get", side_effect=requests.RequestException("boom")), \
              patch("builtins.print") as mock_print:
-            download_file(url, error_path)
+            with self.assertRaises(requests.RequestException):
+                download_file(url, error_path)
             self.assertFalse(os.path.exists(error_path))
             self.assertTrue(mock_print.called)
 

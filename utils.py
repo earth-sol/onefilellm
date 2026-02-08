@@ -115,16 +115,16 @@ def detect_text_format(text_sample: str) -> str:
             import json
             json.loads(text_sample)
             return 'json'
-        except:
+        except Exception:
             pass
-    
+
     # YAML detection
     if yaml and ':' in text_sample:
         try:
             yaml.safe_load(text_sample)
             if '\n' in text_sample and not text_sample.startswith('<'):
                 return 'yaml'
-        except:
+        except Exception:
             pass
     
     # HTML detection
@@ -228,7 +228,10 @@ def download_file(url: str, target_path: str, headers: Optional[Dict[str, str]] 
     if headers:
         combined_headers.update({k: v for k, v in headers.items() if v is not None})
 
-    if not combined_headers.get('Authorization'):
+    # Only auto-add GitHub token for GitHub domains to prevent token leakage
+    parsed_url = urlparse(url)
+    is_github = parsed_url.hostname and parsed_url.hostname.endswith('github.com')
+    if is_github and not combined_headers.get('Authorization'):
         token = os.getenv('GITHUB_TOKEN') or os.getenv('GH_TOKEN')
         if token:
             token = token.strip()
@@ -248,6 +251,7 @@ def download_file(url: str, target_path: str, headers: Optional[Dict[str, str]] 
                         f.write(chunk)
     except requests.RequestException as e:
         print(f"Error downloading file from {url}: {e}")
+        raise
 
 
 def is_same_domain(base_url: str, new_url: str) -> bool:
@@ -259,15 +263,16 @@ def is_within_depth(base_url: str, current_url: str, max_depth: int) -> bool:
     """Check if a URL is within the allowed crawl depth from base URL."""
     base_path = urlparse(base_url).path.rstrip('/')
     current_path = urlparse(current_url).path.rstrip('/')
-    
+
     # Ensure current path starts with base path
     if not current_path.startswith(base_path):
         return False
-        
-    base_depth = len(base_path.split('/')) if base_path else 0
-    current_depth = len(current_path.split('/')) if current_path else 0
-    
-    return (current_depth - base_depth) <= max_depth
+
+    # Filter empty segments from leading slash to avoid off-by-one
+    base_segments = [s for s in base_path.split('/') if s]
+    current_segments = [s for s in current_path.split('/') if s]
+
+    return (len(current_segments) - len(base_segments)) <= max_depth
 
 
 # ===== Path and File Type Utilities =====
@@ -361,5 +366,5 @@ def is_binary_file(filepath: str) -> bool:
             chunk = f.read(8192)  # Read first 8KB
             # Check for null bytes which indicate binary
             return b'\x00' in chunk
-    except:
+    except Exception:
         return True  # If we can't read it, assume binary
