@@ -9,7 +9,7 @@ yt-dlp
 youtube-transcript-api==0.4.1
 pyperclip==1.8.2
 wget==3.2
-tqdm==4.64.0
+tqdm==4.66.3
 rich==12.4.4
 pandas
 openpyxl
